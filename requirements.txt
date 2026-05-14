@@ -1,0 +1,16 @@
+numpy
+scipy
+pandas
+matplotlib
+seaborn
+statsmodels
+ipython
+jupyter
+openpyxl
+xlrd
+julia
+pyjulia
+tqdm
+h5py
+zarr
+torch
