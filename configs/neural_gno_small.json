@@ -1,0 +1,13 @@
+{
+  "data": "outputs/modworm_model_ready.zarr",
+  "stats": "outputs/modworm_model_ready_stats.json",
+  "outdir": "outputs/neural_gno_stage1",
+  "epochs": 20,
+  "batch_size": 8,
+  "window": 16,
+  "lr": 0.0003,
+  "hidden_dim": 128,
+  "layers": 4,
+  "node_emb_dim": 32,
+  "teacher_forcing": 0.25
+}

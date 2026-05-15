@@ -1,0 +1,12 @@
+numpy>=1.24
+scipy>=1.10
+pandas>=2.0
+matplotlib>=3.7
+tqdm>=4.66
+zarr>=2.16,<3
+numcodecs>=0.11
+h5py>=3.9
+pyyaml>=6.0
+openpyxl>=3.1
+xlrd>=2.0
+torch>=2.1
