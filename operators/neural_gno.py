@@ -45,8 +45,11 @@ class EdgeKernelMessageLayer(nn.Module):
         gate = self.kernel(torch.cat([h_src, h_dst, e], dim=-1))
         msg = gate * self.value(h_src)
 
-        agg = torch.zeros_like(h)
+        # AMP can make msg float16 while h remains float32.
+        # index_add_ requires source and destination to have the same dtype.
+        agg = torch.zeros(h.shape, dtype=msg.dtype, device=h.device)
         agg.index_add_(1, dst, msg)
+        agg = agg.to(h.dtype)
 
         out = self.update(torch.cat([h, agg], dim=-1))
         return self.norm(h + out)
