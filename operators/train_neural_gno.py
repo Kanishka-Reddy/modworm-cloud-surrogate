@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Train stage-1 neural-only GNO on friend-1 preprocessed Zarr data."""
+"""Train stage-1 neural-only GNO on friend-1 preprocessed Zarr data.
+
+Adds practical rollout-training features:
+  - one-step validation loss
+  - horizon error curves
+  - training-only state/input noise injection
+  - teacher-forcing decay
+  - train_log.json with per-epoch metrics
+"""
 
 from __future__ import annotations
 
@@ -8,7 +16,9 @@ import json
 import math
 import random
 import sys
+import time
 from pathlib import Path
+from typing import Iterable
 
 import numpy as np
 import torch
@@ -43,19 +53,72 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def rollout_batch(model, batch, graph, device, teacher_forcing_prob: float, s_weight: float):
-    v = batch["v0"].to(device)
-    s = batch["s0"].to(device)
-    u_seq = batch["u"].to(device)
-    v_teacher = batch["v_teacher"].to(device)
-    s_teacher = batch["s_teacher"].to(device)
-    v_next = batch["v_next"].to(device)
-    s_next = batch["s_next"].to(device)
+def parse_horizons(s: str, max_allowed: int | None = None) -> list[int]:
+    vals = sorted({int(x.strip()) for x in s.split(",") if x.strip()})
+    vals = [v for v in vals if v >= 1]
+    if max_allowed is not None:
+        vals = [v for v in vals if v <= max_allowed]
+    if not vals:
+        raise ValueError("No valid horizons were provided")
+    return vals
+
+
+def teacher_forcing_for_epoch(args: argparse.Namespace, epoch: int) -> float:
+    start = float(args.teacher_forcing)
+    end = float(args.teacher_forcing_final)
+    if args.teacher_forcing_decay == "none" or args.epochs <= 1:
+        return start
+    frac = epoch / max(1, args.epochs - 1)
+    if args.teacher_forcing_decay == "linear":
+        return start + frac * (end - start)
+    if args.teacher_forcing_decay == "cosine":
+        # Smoothly interpolate start -> end.
+        w = 0.5 * (1.0 - math.cos(math.pi * frac))
+        return start + w * (end - start)
+    raise ValueError(f"Unknown teacher_forcing_decay={args.teacher_forcing_decay}")
+
+
+def add_noise(x: torch.Tensor, std: float) -> torch.Tensor:
+    if std <= 0.0:
+        return x
+    return x + float(std) * torch.randn_like(x)
+
+
+def rollout_batch(
+    model: NeuralGNO,
+    batch: dict[str, torch.Tensor],
+    graph,
+    device: torch.device,
+    teacher_forcing_prob: float,
+    s_weight: float,
+    state_noise_std: float = 0.0,
+    input_noise_std: float = 0.0,
+    collect_step_losses: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Closed-loop rollout loss for a batch.
+
+    Noise is applied only to model inputs, not to targets. This teaches recovery
+    from small state perturbations without corrupting the supervised labels.
+    """
+    v = batch["v0"].to(device, non_blocking=True)
+    s = batch["s0"].to(device, non_blocking=True)
+    u_seq = batch["u"].to(device, non_blocking=True)
+    v_teacher = batch["v_teacher"].to(device, non_blocking=True)
+    s_teacher = batch["s_teacher"].to(device, non_blocking=True)
+    v_next = batch["v_next"].to(device, non_blocking=True)
+    s_next = batch["s_next"].to(device, non_blocking=True)
 
     losses = []
     horizon = u_seq.shape[1]
     for t in range(horizon):
-        pred_v, pred_s = model(v, s, u_seq[:, t], graph.edge_index, graph.edge_attr)
+        if model.training:
+            v_in = add_noise(v, state_noise_std)
+            s_in = add_noise(s, state_noise_std)
+            u_in = add_noise(u_seq[:, t], input_noise_std)
+        else:
+            v_in, s_in, u_in = v, s, u_seq[:, t]
+
+        pred_v, pred_s = model(v_in, s_in, u_in, graph.edge_index, graph.edge_attr)
         losses.append(neural_loss(pred_v, pred_s, v_next[:, t], s_next[:, t], s_weight=s_weight))
 
         if t < horizon - 1:
@@ -65,11 +128,22 @@ def rollout_batch(model, batch, graph, device, teacher_forcing_prob: float, s_we
             else:
                 v, s = pred_v, pred_s
 
-    return torch.stack(losses).mean()
+    step_losses = torch.stack(losses)
+    loss = step_losses.mean()
+    if collect_step_losses:
+        return loss, step_losses.detach()
+    return loss
 
 
 @torch.no_grad()
-def evaluate(model, loader, graph, device, max_batches: int, s_weight: float) -> float:
+def evaluate_rollout_loss(
+    model: NeuralGNO,
+    loader: DataLoader,
+    graph,
+    device: torch.device,
+    max_batches: int,
+    s_weight: float,
+) -> float:
     model.eval()
     losses = []
     for i, batch in enumerate(loader):
@@ -80,6 +154,76 @@ def evaluate(model, loader, graph, device, max_batches: int, s_weight: float) ->
     if not losses:
         return math.inf
     return float(np.mean(losses))
+
+
+@torch.no_grad()
+def evaluate_horizon_curve(
+    model: NeuralGNO,
+    loader: DataLoader,
+    graph,
+    device: torch.device,
+    horizons: Iterable[int],
+    max_batches: int,
+    s_weight: float,
+) -> dict[str, float]:
+    """Evaluate closed-loop rollout error at multiple horizons.
+
+    Returns both final-step loss at horizon H and mean loss over steps 1..H.
+    This separates local accuracy from long-horizon drift.
+    """
+    model.eval()
+    horizons = sorted(set(int(h) for h in horizons))
+    max_h = max(horizons)
+    final_by_h = {h: [] for h in horizons}
+    mean_by_h = {h: [] for h in horizons}
+
+    for i, batch in enumerate(loader):
+        if i >= max_batches:
+            break
+        u_seq = batch["u"]
+        if u_seq.shape[1] < max_h:
+            continue
+        _, step_losses = rollout_batch(
+            model,
+            batch,
+            graph,
+            device,
+            teacher_forcing_prob=0.0,
+            s_weight=s_weight,
+            collect_step_losses=True,
+        )
+        # step_losses shape: [window]
+        for h in horizons:
+            final_by_h[h].append(float(step_losses[h - 1].item()))
+            mean_by_h[h].append(float(step_losses[:h].mean().item()))
+
+    out: dict[str, float] = {}
+    for h in horizons:
+        out[f"h{h}_final"] = float(np.mean(final_by_h[h])) if final_by_h[h] else math.inf
+        out[f"h{h}_mean"] = float(np.mean(mean_by_h[h])) if mean_by_h[h] else math.inf
+    return out
+
+
+def make_loader(
+    data: str,
+    indices: list[int],
+    window: int,
+    batch_size: int,
+    device: torch.device,
+    preload: bool,
+    shuffle: bool,
+    num_workers: int,
+    drop_last: bool,
+) -> DataLoader:
+    ds = NeuralWindowDataset(data, indices, window=window, preload=preload)
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=(device.type == "cuda"),
+        drop_last=drop_last,
+    )
 
 
 def main():
@@ -98,7 +242,19 @@ def main():
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--delta-scale", type=float, default=0.05)
     parser.add_argument("--s-weight", type=float, default=1.0)
-    parser.add_argument("--teacher-forcing", type=float, default=0.25)
+    parser.add_argument("--teacher-forcing", type=float, default=0.25, help="Initial teacher-forcing probability")
+    parser.add_argument("--teacher-forcing-final", type=float, default=0.05, help="Final teacher-forcing probability")
+    parser.add_argument(
+        "--teacher-forcing-decay",
+        type=str,
+        choices=("none", "linear", "cosine"),
+        default="linear",
+        help="Schedule for teacher forcing across epochs",
+    )
+    parser.add_argument("--state-noise-std", type=float, default=0.0, help="Training-only Gaussian noise on v/s inputs")
+    parser.add_argument("--input-noise-std", type=float, default=0.0, help="Training-only Gaussian noise on perturbation input")
+    parser.add_argument("--eval-horizons", type=str, default="1,4,8,16,32,64", help="Comma-separated closed-loop eval horizons")
+    parser.add_argument("--eval-max-batches", type=int, default=20)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=0)
@@ -116,30 +272,29 @@ def main():
         print(f"{key}: {shape}")
 
     n_rollouts = shapes["state_t/neural_v"][0]
+    total_T = shapes["state_t/neural_v"][1]
     train_idx, test_idx = load_split_indices(args.stats, n_rollouts)
     print(f"Train rollouts: {len(train_idx)} | Test rollouts: {len(test_idx)}")
 
-    train_ds = NeuralWindowDataset(args.data, train_idx, window=args.window, preload=not args.no_preload)
-    test_ds = NeuralWindowDataset(args.data, test_idx, window=args.window, preload=not args.no_preload)
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        drop_last=True,
+    horizons = parse_horizons(args.eval_horizons, max_allowed=total_T)
+    max_eval_horizon = max(horizons)
+
+    preload = not args.no_preload
+    train_loader = make_loader(
+        args.data, train_idx, args.window, args.batch_size, device, preload, True, args.num_workers, True
     )
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        drop_last=False,
+    # For the headline validation rollout metric, use the training window.
+    val_loader = make_loader(
+        args.data, test_idx, args.window, args.batch_size, device, preload, False, args.num_workers, False
+    )
+    # For horizon curves, use one validation dataset with the maximum requested horizon.
+    horizon_loader = make_loader(
+        args.data, test_idx, max_eval_horizon, args.batch_size, device, preload, False, args.num_workers, False
     )
 
     graph = build_graph_tensors(device=device)
     print(f"Graph: N={graph.num_nodes}, E={graph.edge_index.shape[1]}, edge_attr={graph.edge_attr.shape[1]}")
+    print(f"Eval horizons: {horizons}")
 
     model = NeuralGNO(
         num_nodes=graph.num_nodes,
@@ -152,7 +307,7 @@ def main():
     ).to(device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
     config = vars(args).copy()
     config.update({"num_nodes": graph.num_nodes, "edge_attr_dim": graph.edge_attr.shape[1]})
@@ -163,19 +318,24 @@ def main():
     history = []
 
     for epoch in range(args.epochs):
+        epoch_t0 = time.time()
+        tf_prob = teacher_forcing_for_epoch(args, epoch)
+
         model.train()
         pbar = tqdm(train_loader, desc=f"epoch {epoch:03d}", leave=False)
         train_losses = []
         for batch in pbar:
             opt.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
                 loss = rollout_batch(
                     model,
                     batch,
                     graph,
                     device,
-                    teacher_forcing_prob=args.teacher_forcing,
+                    teacher_forcing_prob=tf_prob,
                     s_weight=args.s_weight,
+                    state_noise_std=args.state_noise_std,
+                    input_noise_std=args.input_noise_std,
                 )
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -183,27 +343,64 @@ def main():
             scaler.step(opt)
             scaler.update()
             train_losses.append(float(loss.item()))
-            pbar.set_postfix(loss=f"{np.mean(train_losses[-20:]):.4e}")
+            pbar.set_postfix(loss=f"{np.mean(train_losses[-20:]):.4e}", tf=f"{tf_prob:.2f}")
 
-        val_loss = evaluate(model, test_loader, graph, device, max_batches=20, s_weight=args.s_weight)
+        # Headline validation: same horizon/window as training, fully closed loop.
+        val_rollout_loss = evaluate_rollout_loss(
+            model, val_loader, graph, device, max_batches=args.eval_max_batches, s_weight=args.s_weight
+        )
+        horizon_metrics = evaluate_horizon_curve(
+            model,
+            horizon_loader,
+            graph,
+            device,
+            horizons=horizons,
+            max_batches=args.eval_max_batches,
+            s_weight=args.s_weight,
+        )
+        val_one_step_loss = horizon_metrics.get("h1_final", math.inf)
+
         train_loss = float(np.mean(train_losses)) if train_losses else math.inf
-        row = {"epoch": epoch, "train_loss": train_loss, "val_rollout_loss": val_loss}
+        row = {
+            "epoch": epoch,
+            "epoch_sec": time.time() - epoch_t0,
+            "teacher_forcing": tf_prob,
+            "train_loss": train_loss,
+            "val_one_step_loss": val_one_step_loss,
+            "val_rollout_loss": val_rollout_loss,
+            **{f"val_{k}": v for k, v in horizon_metrics.items()},
+        }
         history.append(row)
-        print(f"epoch {epoch:03d} | train {train_loss:.6e} | val_rollout {val_loss:.6e}")
+
+        summary_bits = [
+            f"epoch {epoch:03d}",
+            f"train {train_loss:.6e}",
+            f"val_1step {val_one_step_loss:.6e}",
+            f"val_rollout {val_rollout_loss:.6e}",
+            f"tf {tf_prob:.3f}",
+        ]
+        # Print compact horizon final errors only.
+        h_summary = " ".join(f"h{h}:{horizon_metrics[f'h{h}_final']:.2e}" for h in horizons)
+        print(" | ".join(summary_bits) + " | " + h_summary)
 
         ckpt = {
             "model": model.state_dict(),
             "config": config,
             "epoch": epoch,
-            "val_rollout_loss": val_loss,
+            "val_one_step_loss": val_one_step_loss,
+            "val_rollout_loss": val_rollout_loss,
+            "horizon_metrics": horizon_metrics,
             "graph_edge_attr_names": graph.edge_attr_names,
         }
         torch.save(ckpt, outdir / "latest.pt")
-        if val_loss < best_val:
-            best_val = val_loss
+        if val_rollout_loss < best_val:
+            best_val = val_rollout_loss
             torch.save(ckpt, outdir / "best.pt")
 
+        # Keep both names for convenience/backward compatibility.
         with open(outdir / "history.json", "w") as f:
+            json.dump(history, f, indent=2)
+        with open(outdir / "train_log.json", "w") as f:
             json.dump(history, f, indent=2)
 
     print(f"Done. Best validation rollout loss: {best_val:.6e}")

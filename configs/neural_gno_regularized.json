@@ -1,0 +1,20 @@
+{
+  "epochs": 50,
+  "batch_size": 16,
+  "window": 16,
+  "lr": 0.0005,
+  "weight_decay": 0.0001,
+  "hidden_dim": 128,
+  "layers": 3,
+  "node_emb_dim": 32,
+  "dropout": 0.05,
+  "delta_scale": 0.05,
+  "s_weight": 1.0,
+  "teacher_forcing": 0.25,
+  "teacher_forcing_final": 0.05,
+  "teacher_forcing_decay": "linear",
+  "state_noise_std": 0.01,
+  "input_noise_std": 0.0,
+  "eval_horizons": "1,4,8,16,32,64",
+  "eval_max_batches": 20
+}

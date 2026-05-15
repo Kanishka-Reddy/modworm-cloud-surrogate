@@ -45,8 +45,9 @@ class EdgeKernelMessageLayer(nn.Module):
         gate = self.kernel(torch.cat([h_src, h_dst, e], dim=-1))
         msg = gate * self.value(h_src)
 
-        # AMP can make msg float16 while h remains float32.
-        # index_add_ requires source and destination to have the same dtype.
+        # AMP can make msg float16 while h remains float32. index_add_ requires
+        # source and destination dtypes to match, so aggregate in msg dtype and
+        # cast back before the residual update.
         agg = torch.zeros(h.shape, dtype=msg.dtype, device=h.device)
         agg.index_add_(1, dst, msg)
         agg = agg.to(h.dtype)
