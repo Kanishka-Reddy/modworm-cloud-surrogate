@@ -25,7 +25,9 @@ class SpectralConv1d(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, C, N]
         b, c, n = x.shape
-        x_ft = torch.fft.rfft(x, dim=-1)
+        # CUDA FFT does not support every autocast half-precision shape. Keep
+        # the spectral path in float32 so fresh Colab runs work under AMP.
+        x_ft = torch.fft.rfft(x.to(torch.float32), dim=-1)
         max_modes = min(self.modes, x_ft.shape[-1])
         out_ft = torch.zeros(b, c, x_ft.shape[-1], dtype=x_ft.dtype, device=x.device)
         w = torch.complex(self.weight_real[:, :, :max_modes], self.weight_imag[:, :, :max_modes])

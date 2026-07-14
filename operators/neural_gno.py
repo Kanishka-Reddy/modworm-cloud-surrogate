@@ -18,8 +18,19 @@ class EdgeKernelMessageLayer(nn.Module):
     from [h_src, h_dst, edge_attr]. The gated source value is aggregated at dst.
     """
 
-    def __init__(self, hidden_dim: int, edge_attr_dim: int, kernel_hidden: int = 128, dropout: float = 0.0):
+    def __init__(
+        self,
+        hidden_dim: int,
+        edge_attr_dim: int,
+        kernel_hidden: int = 128,
+        dropout: float = 0.0,
+        aggregation: str = "sum",
+    ):
         super().__init__()
+        aggregation = str(aggregation).strip().lower()
+        if aggregation not in {"sum", "mean"}:
+            raise ValueError(f"aggregation must be sum or mean, got {aggregation!r}")
+        self.aggregation = aggregation
         self.value = nn.Linear(hidden_dim, hidden_dim)
         self.kernel = nn.Sequential(
             nn.Linear(2 * hidden_dim + edge_attr_dim, kernel_hidden),
@@ -50,6 +61,9 @@ class EdgeKernelMessageLayer(nn.Module):
         # cast back before the residual update.
         agg = torch.zeros(h.shape, dtype=msg.dtype, device=h.device)
         agg.index_add_(1, dst, msg)
+        if self.aggregation == "mean":
+            degree = torch.bincount(dst, minlength=h.shape[1]).to(dtype=msg.dtype)
+            agg = agg / degree.clamp_min(1.0).view(1, -1, 1)
         agg = agg.to(h.dtype)
 
         out = self.update(torch.cat([h, agg], dim=-1))
@@ -69,9 +83,11 @@ class NeuralGNO(nn.Module):
         node_emb_dim: int = 32,
         dropout: float = 0.0,
         delta_scale: float = 0.05,
+        aggregation: str = "sum",
     ):
         super().__init__()
         self.num_nodes = int(num_nodes)
+        self.aggregation = str(aggregation).strip().lower()
         self.delta_scale = nn.Parameter(torch.tensor(float(delta_scale)))
         self.node_emb = nn.Embedding(num_nodes, node_emb_dim)
         self.encoder = nn.Sequential(
@@ -80,7 +96,15 @@ class NeuralGNO(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.layers = nn.ModuleList(
-            [EdgeKernelMessageLayer(hidden_dim, edge_attr_dim, dropout=dropout) for _ in range(layers)]
+            [
+                EdgeKernelMessageLayer(
+                    hidden_dim,
+                    edge_attr_dim,
+                    dropout=dropout,
+                    aggregation=self.aggregation,
+                )
+                for _ in range(layers)
+            ]
         )
         self.head = nn.Sequential(
             nn.LayerNorm(hidden_dim),
