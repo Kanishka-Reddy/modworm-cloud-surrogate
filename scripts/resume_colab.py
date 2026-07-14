@@ -111,6 +111,27 @@ def completed_epochs(run_directory: Path) -> int:
         return 0
 
 
+def validate_pipeline(automation_root: Path) -> None:
+    revision = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"],
+        cwd=REPO_ROOT,
+        text=True,
+    ).strip()
+    marker = automation_root / f"pipeline_validation_{revision}.json"
+    if marker.exists():
+        log(f"SKIP pipeline validation already passed for {revision[:12]}")
+        return
+    run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "validate_reaudit.py"),
+            "--repo",
+            str(REPO_ROOT),
+        ]
+    )
+    write_json(marker, {"revision": revision, "status": "passed"})
+
+
 def train_degree_preserving_if_missing(data: Path, splits: Path, audit_root: Path) -> dict[int, Path]:
     runs: dict[int, Path] = {}
     for graph_seed in (0, 1, 2):
@@ -521,6 +542,10 @@ def main() -> None:
     automation_root.mkdir(parents=True, exist_ok=True)
     RUNNER_LOG = automation_root / "runner.log"
     status_path = automation_root / "status.json"
+
+    # Validate the checked-out code before touching any expensive Drive run.
+    # The commit-specific marker makes this free on later reconnects.
+    validate_pipeline(automation_root)
 
     data = discover_dataset(drive_root)
     stats = discover_stats(drive_root)
